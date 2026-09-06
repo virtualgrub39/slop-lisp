@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <string.h>
@@ -7,7 +8,7 @@
 typedef enum
 {
     ATOM_NIL,
-    ATOM_INT,
+    ATOM_NUM,
     ATOM_SYM,
     ATOM_STR,
     ATOM_PAIR,
@@ -27,7 +28,7 @@ struct atom
     
     union
     {
-        int integer;
+        float number;
         char *symbol;
         char *string;
         struct { AtomRef head, tail; } pair;
@@ -68,7 +69,7 @@ void interpreter_deinit (Interpreter *I);
 
 AtomRef new_atom (Interpreter *I, AtomKind kind);
 AtomRef atom_nil (Interpreter *I);
-AtomRef atom_int (Interpreter *I, int i);
+AtomRef atom_num (Interpreter *I, float n);
 AtomRef atom_sym (Interpreter *I, const char *sym);
 AtomRef atom_sym_n (Interpreter *I, const char *ptr, size_t n); /* sized */
 AtomRef atom_str (Interpreter *I, const char *str);
@@ -102,6 +103,32 @@ void root_clear (Interpreter *I);
 
 AtomRef eval (Interpreter *I, AtomRef expr);
 
+/* parsing */
+
+typedef enum
+{
+    PARSE_OK = 0,
+    PARSE_ERR_UNRECOGNISED_CHAR,
+    PARSE_ERR_UNEXPECTED_EOF,
+    PARSE_ERR_UNEXPECTED_TOKEN,
+    PARSE_ERR_INVALID_NUMBER_SYNTAX,
+    PARSE_ERR_INVALID_CHAR_SYNTAX,
+    PARSE_ERR_UNCLOSED_QUOTE,
+    PARSE_ERR_INVALID_ESCAPE_CODE,
+    PARSE_ERR_UNBALANCED_PAREN,
+} ParseErrorCode;
+
+typedef struct
+{
+    ParseErrorCode code;
+    size_t offset;
+} ParseError;
+
+AtomRef parse_atom (Interpreter *I, const char *expr_str, ParseError *out_err);
+char *serialize_atom (AtomRef expr, size_t *out_sz);
+
+/* primitives */
+
 AtomRef prim_lt (Interpreter *I, AtomRef args)
 {
     AtomRef lhs = car(args);
@@ -110,12 +137,12 @@ AtomRef prim_lt (Interpreter *I, AtomRef args)
     AtomRef ev_lhs = eval (I, lhs);
     AtomRef ev_rhs = eval (I, rhs);
     
-    assert (ev_lhs->kind == ATOM_INT);
-    assert (ev_rhs->kind == ATOM_INT);
+    assert (ev_lhs->kind == ATOM_NUM);
+    assert (ev_rhs->kind == ATOM_NUM);
     
-    if (ev_lhs->as.integer < ev_rhs->as.integer)
+    if (ev_lhs->as.number < ev_rhs->as.number)
     {
-        return atom_int (I, 1);
+        return atom_num (I, 1);
     }
     else
     {
@@ -126,110 +153,105 @@ AtomRef prim_lt (Interpreter *I, AtomRef args)
 AtomRef prim_print (Interpreter *I, AtomRef args)
 {
     // FIXME: print everything in the list, and handle all atom types
+    (void) I;
     AtomRef arg = car(args);
     assert (arg->kind == ATOM_STR);
     printf ("%s\n", arg->as.string);
     return nil;
 }
 
-int main (void)
+/* input / runtime */
+
+char *read_whole (FILE *in, size_t *out_sz)
 {
+    size_t cap = 128;
+    size_t sz = 0;
+    char *buf;
+    
+    if (!in) return NULL;
+    
+    buf = malloc (cap * sizeof *buf);
+    
+    while (1)
+    {
+        size_t n = fread (buf + sz, sizeof *buf, cap - sz, in);
+        if (n == 0)
+        {
+            if (feof (in)) break;
+            else if (ferror (in))
+            {
+                perror ("fread");
+                free (buf);
+                return NULL;
+            }
+        }
+        
+        sz += n;
+        
+        if (sz >= (cap - 1))
+        {
+            cap *= 2;
+            buf = realloc (buf, cap * sizeof *buf);
+        }
+    }
+    
+    buf = realloc (buf, (sz + 1) * sizeof *buf);
+    buf[sz] = 0;
+    
+    if (out_sz) *out_sz = sz;
+    
+    return buf;
+}
+ 
+int main (int argc, char *argv[])
+{
+    FILE *in = stdin;
+    if (argc > 1)
+    {
+        in = fopen (argv[1], "rb");
+    }
+    
+    size_t src_len;
+    char *src = read_whole (in, &src_len);
+    if (!src) goto cleanup;
+    
     Interpreter I = { 0 };
     interpreter_init (&I);
     
     env_prim_set (&I, "lt", prim_lt);
     env_prim_set (&I, "print", prim_print);
+    env_c_set (&I, "nil", nil);
     
-
-    /*
-        (define x 69)
-        (if (lt x 10)
-            (print "I love Hatsune Miku~")
-            (print "I'm the top goy!"))
-    */
-    AtomRef x_sym = atom_sym (&I, "x");
-    root_push (&I, x_sym);
-    AtomRef x_val = atom_int (&I, 69);
-    root_push (&I, x_val);
-    AtomRef def_arg_1 = atom_pair (&I, x_val, nil);
-    root_pop (&I); // x_val
-    root_push (&I, def_arg_1);
-    AtomRef def_arg_2 = atom_pair (&I, x_sym, def_arg_1);
-    root_pop (&I); // def_arg_1
-    root_pop (&I); // x_sym
-    root_push (&I, def_arg_2);
-    AtomRef def_sym = atom_sym (&I, "define");
-    root_push (&I, def_sym);
-    AtomRef def_expr = atom_pair (&I, def_sym, def_arg_2);
-    root_pop (&I); // def_sym
-    root_pop (&I); // def_arg_2
-    root_push (&I, def_expr);
-    (void) eval (&I, def_expr);
-    root_pop (&I); // def_expr
-    
-
-    AtomRef expr_else_print = atom_sym (&I, "print");
-    root_push (&I, expr_else_print);
-    
-    AtomRef expr_else_print_what = atom_str (&I, "I'm the top goy!");
-    root_push (&I, expr_else_print_what);
-    
-    AtomRef expr_else_print_args = atom_pair (&I, expr_else_print_what, nil);
-    root_push (&I, expr_else_print_args);
-    
-    AtomRef expr_else = atom_pair (&I, expr_else_print, expr_else_print_args);
-    root_push (&I, expr_else);
-    
-    AtomRef expr_then_print = atom_sym (&I, "print");
-    root_push (&I, expr_then_print);
-    
-    AtomRef expr_then_print_what = atom_str (&I, "I love Hatsune Miku~");
-    root_push (&I, expr_then_print_what);
-    
-    AtomRef expr_then_print_args = atom_pair (&I, expr_then_print_what, nil);
-    root_push (&I, expr_then_print_args);
-    
-    AtomRef expr_then = atom_pair (&I, expr_then_print, expr_then_print_args);
-    root_push (&I, expr_then);
-    
-    AtomRef x = atom_sym (&I, "x");
-    root_push (&I, x);
-    
-    AtomRef ten = atom_int (&I, 10);
-    root_push (&I, ten);
-    
-    AtomRef lt = atom_sym (&I, "lt");
-    root_push (&I, lt);
-    
-    AtomRef lt_args_1 = atom_pair (&I, ten, nil);
-    root_push (&I, lt_args_1);
-    
-    AtomRef lt_args_2 = atom_pair (&I, x, lt_args_1);
-    root_push (&I, lt_args_2);
-    
-    AtomRef cond = atom_pair (&I, lt, lt_args_2);
-    root_push (&I, cond);
-    
-    AtomRef if_args_1 = atom_pair (&I, expr_else, nil);
-    root_push (&I, if_args_1);
-    
-    AtomRef if_args_2 = atom_pair (&I, expr_then, if_args_1);
-    root_push (&I, if_args_2);
-    
-    AtomRef if_args_3 = atom_pair (&I, cond, if_args_2);
-    root_push (&I, if_args_3);
-    
-    AtomRef if_atom = atom_sym (&I, "if");
-    root_push (&I, if_atom);
-    
-    AtomRef expr = atom_pair (&I, if_atom, if_args_3); // final expression
+    ParseError err;
+    AtomRef expr = parse_atom (&I, src, &err);
+    if (!expr)
+    {
+        printf ("PARSING ERR %d at offset %lu\n", err.code, err.offset);
+        goto another_cleanup_ig;
+    }
     root_push (&I, expr);
     
-    (void) eval (&I, expr);
+    free (src);
     
-    root_clear (&I);
+    AtomRef result = eval (&I, expr);
+    root_pop (&I);
+    root_push (&I, result);
+    
+    if (result)
+    {
+        printf ("there is SOME result btw.\n");
+    }
 
-    interpreter_deinit (&I);
+another_cleanup_ig:
+        interpreter_deinit (&I);
+    
+cleanup:
+        if (argc > 1)
+        {
+            fclose (in);
+        }
+    
+        return 0;
 }
 
 void env_prim_set (Interpreter *I, const char *symbol, PrimitiveFn fn)
@@ -283,7 +305,7 @@ static AtomRef eval_list (Interpreter *I, AtomRef list)
     return result;
 }
 
-AtomRef bind (Interpreter *I, AtomRef symbols, AtomRef vals)
+void bind (Interpreter *I, AtomRef symbols, AtomRef vals)
 {
     AtomRef symbol = symbols;
     AtomRef val = vals;
@@ -327,18 +349,30 @@ AtomRef eval_lambda (Interpreter *I, AtomRef lambda)
     return atom_clos (I, args, body, env);
 }
 
+static AtomRef eval_do (Interpreter *I, AtomRef body)
+{
+    AtomRef result = nil;
+    while (body != nil && body->kind == ATOM_PAIR)
+    {
+        result = eval (I, car(body));
+        body = cdr(body);
+    }
+    return result;
+}
+
 AtomRef eval (Interpreter *I, AtomRef expr)
 {
     switch (expr->kind)
     {
-        case ATOM_INT:
+        case ATOM_NUM:
         case ATOM_NIL:
         case ATOM_STR:
         case ATOM_PRIM:
+        case ATOM_CLOS:
             return expr;
         case ATOM_SYM:
             return env_get (I, expr);
-        break;
+            break;
         case ATOM_PAIR:
         {
             AtomRef what = car (expr);
@@ -350,8 +384,22 @@ AtomRef eval (Interpreter *I, AtomRef expr)
                 return to;
             else if (what->kind == ATOM_SYM && strcmp (what->as.symbol, "define") == 0)
             {
-                env_set (I, car(to), car(cdr(to)));
+                AtomRef sym = car(to);
+                AtomRef val_expr = car(cdr(to));
+
+                root_push(I, sym);
+                AtomRef val = eval(I, val_expr);
+                root_push(I, val);
+
+                env_set(I, sym, val);
+
+                root_pop(I); // val
+                root_pop(I); // sym
                 return nil;
+            }
+            else if (what->kind == ATOM_SYM && strcmp (what->as.symbol, "do") == 0)
+            {
+                return eval_do (I, to);
             }
             else if (what->kind == ATOM_SYM && strcmp (what->as.symbol, "lambda") == 0)
                 return eval_lambda (I, expr);
@@ -375,15 +423,18 @@ AtomRef eval (Interpreter *I, AtomRef expr)
             }
         }
         break;
+        default:
+            assert (false);
     }
 }
 
 void interpreter_init (Interpreter *I)
 {
     I->allocated = NULL;
-    I->env = nil;
     I->root_top = 0;
     I->n_allocated = 0;
+    I->env = nil;
+    I->env = atom_pair(I, nil, nil);
 }
 
 void interpreter_deinit (Interpreter *I)
@@ -414,13 +465,14 @@ AtomRef new_atom (Interpreter *I, AtomKind kind)
 
 AtomRef atom_nil (Interpreter *I)
 {
+    (void) I;
     return nil;
 }
 
-AtomRef atom_int (Interpreter *I, int i)
+AtomRef atom_num (Interpreter *I, float n)
 {
-    Atom *a = new_atom (I, ATOM_INT);
-    a->as.integer = i;
+    Atom *a = new_atom (I, ATOM_NUM);
+    a->as.number = n;
     return a;
 }
 
@@ -431,7 +483,12 @@ AtomRef atom_sym (Interpreter *I, const char *sym)
     return a;
 }
 
-AtomRef atom_sym_n (Interpreter *I, const char *ptr, size_t n); /* sized */
+AtomRef atom_sym_n (Interpreter *I, const char *ptr, size_t n)
+{
+    Atom *a = new_atom (I, ATOM_SYM);
+    a->as.symbol = strndup (ptr, n);
+    return a;
+}
 
 AtomRef atom_str (Interpreter *I, const char *str)
 {
@@ -463,6 +520,7 @@ AtomRef atom_clos (Interpreter *I, AtomRef args, AtomRef body, AtomRef env)
     a->as.closure.params = args;
     a->as.closure.body = body;
     a->as.closure.env = env;
+    return a;
 }
 
 void root_push (Interpreter *I, AtomRef ref)
@@ -599,4 +657,543 @@ AtomRef env_get (Interpreter *I, AtomRef symbol)
         cur_frame = cdr(cur_frame);
     }
     return nil;
+}
+
+enum token_kind
+{
+    TOKEN_EOF = 0,
+    TOKEN_LPAREN,
+    TOKEN_RPAREN,
+    TOKEN_SYMBOL,
+    TOKEN_NUMBER,
+    TOKEN_STRING,
+};
+
+struct token
+{
+    enum token_kind kind;
+    
+    const char *ptr;
+    size_t length;
+    size_t offset;
+    
+    struct token *next;
+};
+
+static struct token *
+        token_new (enum token_kind kind, const char *ptr, size_t offset, size_t length)
+{
+    struct token *t = malloc (sizeof *t);
+    if (!t) return NULL;
+    
+    t->kind = kind;
+    t->ptr = ptr;
+    t->offset = offset;
+    t->length = length;
+    
+    t->next = NULL;
+    
+    return t;
+}
+
+static void token_free (struct token *t)
+{
+    while (t)
+    {
+        struct token *next = t->next;
+        free (t);
+        t = next;
+    }
+}
+
+static bool is_space (char c)
+{
+    return c && strchr ("\n\r\t\v ", (unsigned char) c) != NULL;
+}
+
+static bool is_alpha (char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+static bool is_digit (char c)
+{
+    return (c >= '0' && c <= '9');
+}
+
+static bool is_symbol_char (char c)
+{
+    return c && (is_alpha (c) || is_digit (c) || strchr ("+-!@$%~^&*<>=.,/`", (unsigned char) c) != NULL);
+}
+
+static char to_lower (char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 32;
+    return c;
+}
+
+struct lexer
+{
+    const char *src;
+    size_t idx;
+    size_t len;
+    ParseError *err;
+};
+
+static bool reached_end (struct lexer *L)
+{
+    return L->idx >= L->len;
+}
+
+static char current_char (struct lexer *L)
+{
+    return L->src[L->idx];
+}
+
+static const char *
+        current_ptr (struct lexer *L)
+{
+    return L->src + L->idx;
+}
+
+static void bump_n (struct lexer *L, size_t N)
+{
+    if (L->idx + N <= L->len) L->idx += N;
+}
+
+static void bump (struct lexer *L)
+{
+    bump_n (L, 1);
+}
+
+static void skip_whitespace (struct lexer *L)
+{
+    while (!reached_end (L) && is_space (current_char (L))) bump (L);
+}
+
+static struct token *
+        lex_number (struct lexer *L)
+{
+    size_t start = L->idx;
+    
+    if (current_char (L) == '-' || current_char (L) == '+')
+    {
+        bump (L);
+    }
+    
+    while (!reached_end (L) && is_digit (current_char (L)))
+    {
+        bump (L);
+    }
+    
+    if (!reached_end (L) && current_char (L) == '.')
+    {
+        bump (L);
+         
+        while (!reached_end (L) && is_digit (current_char (L)))
+        {
+            bump (L);
+        }
+    }
+    
+    if (!reached_end (L) && to_lower (current_char (L)) == 'e')
+    {
+        bump (L);
+        if (!reached_end (L) && (current_char (L) == '-' || current_char (L) == '+'))
+        {
+            bump (L);
+        }
+        while (!reached_end (L) && is_digit (current_char (L)))
+        {
+            bump (L);
+        }
+    }
+    
+    return token_new (TOKEN_NUMBER, L->src + start, start, L->idx - start);
+}
+
+static struct token *
+        lex_next (struct lexer *L)
+{
+    struct token *t;
+    char current;
+    
+    skip_whitespace (L);
+    if (reached_end (L))
+    {
+        return token_new (TOKEN_EOF, current_ptr (L), L->idx, 0);
+    }
+    
+    current = current_char (L);
+    
+    switch (current)
+    {
+        case '(': 
+            t = token_new (TOKEN_LPAREN, current_ptr (L), L->idx, 1);
+            bump (L);
+            return t;
+        case ')':
+            t = token_new (TOKEN_RPAREN, current_ptr (L), L->idx, 1);
+            bump (L);
+            return t;
+    }
+    
+    if (current == '-' || current == '+')
+    {
+        if (L->idx + 1 >= L->len || !is_digit (L->src[L->idx+1]))
+        {
+            /* fall through to `is_symbol_char` lmao */
+        }
+        else
+        {
+            return lex_number (L);
+        }
+    }
+    
+    if (is_digit (current) || current == '.')
+    {
+        return lex_number (L);
+    }
+    
+    if (is_symbol_char (current))
+    {
+        size_t offset = L->idx + 1;
+        
+        while (offset < L->len && is_symbol_char (L->src[offset]))
+        {
+            offset += 1;
+        }
+        
+        t = token_new (TOKEN_SYMBOL, current_ptr (L), L->idx, offset - L->idx);
+        L->idx = offset;
+        return t;
+    }
+    
+    if (current == '"')
+    {
+        size_t offset = L->idx + 1;
+        
+        while (offset < L->len && L->src[offset] != '"')
+        {
+            if (L->len - offset > 1 && L->src[offset] == '\\')
+                offset += 1;
+            offset += 1;
+        }
+        
+        if (offset >= L->len || L->src[offset] != '"')
+        {
+            if (L->err)
+            {
+                L->err->code = PARSE_ERR_UNCLOSED_QUOTE;
+                L->err->offset = L->idx;
+            }
+            return NULL;
+        }
+        
+        offset += 1;
+        
+        t = token_new (TOKEN_STRING, current_ptr (L), L->idx, offset - L->idx);
+        L->idx = offset;
+        return t;
+    }
+    
+    if (L->err)
+    {
+        L->err->code = PARSE_ERR_UNRECOGNISED_CHAR;
+        L->err->offset = L->idx;
+    }
+    
+    return NULL;
+}
+
+static struct token *
+        lex (const char *src, size_t n, ParseError *out_err)
+{
+    struct lexer L;
+    struct token *head = NULL;
+    struct token *tail = NULL;
+    
+    L.src = src;
+    L.idx = 0;
+    L.len = n ? n : strlen (src);
+    L.err = out_err;
+    
+    while (1)
+    {
+        struct token *next = lex_next (&L);
+        if (!next)
+        {
+            token_free (head);
+            return NULL;
+        }
+        if (head == NULL)
+        {
+            head = next;
+            tail = head;
+        }
+        else
+        {
+            tail->next = next;
+            tail = tail->next;
+        }
+        if (next->kind == TOKEN_EOF)
+            break;
+    }
+    
+    return head;
+}
+
+static struct token *
+        next (struct token **head, ParseError *out_err)
+{
+    struct token *next_tok;
+    if (!head || !*head)
+    {
+        if (out_err)
+        {
+            out_err->code = PARSE_ERR_UNEXPECTED_EOF;
+            out_err->offset = 0;
+        }
+        return NULL;
+    }
+    
+    next_tok = *head;
+    *head = (*head)->next;
+    
+    return next_tok;
+}
+
+static struct token *
+peek (struct token **head, ParseError *out_err)
+{
+    if (!head || !*head)
+    {
+        if (out_err)
+        {
+            out_err->code = PARSE_ERR_UNEXPECTED_EOF;
+            out_err->offset = 0;
+        }
+        return NULL;
+    }
+    
+    return *head;
+}
+
+static struct token *
+expect (struct token **head, enum token_kind kind, ParseError *out_err)
+{
+    struct token *next_tok = next (head, out_err);
+    if (!head || !*head)
+    {
+        if (out_err)
+        {
+            out_err->code = PARSE_ERR_UNEXPECTED_EOF;
+            out_err->offset = 0;
+        }
+        return NULL;
+    }
+    
+    if (next_tok->kind != kind)
+    {
+        if (out_err)
+        {
+            out_err->code = PARSE_ERR_UNEXPECTED_TOKEN;
+            out_err->offset = next_tok->offset;
+        }
+        return NULL;
+    }
+    
+    return next_tok;
+}
+
+static AtomRef parse_list_tail (Interpreter *I, struct token **head, ParseError *out_err);
+static AtomRef parse_atom_tokens (Interpreter *I, struct token **head, ParseError *out_err);
+
+static AtomRef parse_list (Interpreter *I, struct token **head, ParseError *out_err)
+{
+    if (!expect (head, TOKEN_LPAREN, out_err))
+        return NULL;
+    return parse_list_tail (I, head, out_err);
+}
+
+static AtomRef parse_list_tail (Interpreter *I, struct token **head, ParseError *out_err)
+{
+    AtomRef head_expr, tail_expr;
+    struct token *tok = peek (head, out_err);
+    if (!tok) return NULL;
+    
+    if (tok->kind == TOKEN_RPAREN)
+    {
+        next (head, out_err);
+        return atom_pair (I, nil, nil);
+    }
+    
+    head_expr = parse_atom_tokens (I, head, out_err);
+    if (!head_expr) return NULL;
+    
+    tok = peek (head, out_err);
+    if (!tok) return NULL;
+    
+    root_push (I, head_expr);
+    
+    if (tok->kind == TOKEN_RPAREN)
+    {
+        next (head, out_err);
+        AtomRef result = atom_pair (I, head_expr, nil);
+        root_pop (I);
+        return result;
+    }
+    
+    tail_expr = parse_list_tail (I, head, out_err);
+    if (!tail_expr)
+    {
+        root_pop (I);
+        return NULL;
+    }
+    root_push (I, tail_expr);
+    
+    AtomRef result = atom_pair (I, head_expr, tail_expr);
+    root_pop (I);
+    root_pop (I);
+    return result;
+}
+
+static AtomRef parse_number (Interpreter *I, struct token **head, ParseError *out_err)
+{
+    struct token *num_tok = expect (head, TOKEN_NUMBER, out_err);
+    char *num_buf;
+    char *end_ptr;
+    float i;
+    
+    if (!num_tok) return NULL;
+    
+    num_buf = calloc (num_tok->length + 1, sizeof *num_buf);
+    memcpy (num_buf, num_tok->ptr, num_tok->length);
+    
+    i = (float) strtod (num_buf, &end_ptr);
+    if (*end_ptr != 0)
+    {
+        free (num_buf);
+        if (out_err)
+        {
+            out_err->code = PARSE_ERR_INVALID_NUMBER_SYNTAX;
+            out_err->offset = num_tok->offset;
+        }
+        return NULL;
+    }
+    
+    free (num_buf);
+    return atom_num (I, i);
+}
+
+static AtomRef parse_symbol (Interpreter *I, struct token **head, ParseError *out_err)
+{
+    struct token *sym_tok = expect (head, TOKEN_SYMBOL, out_err);
+    if (!sym_tok) return NULL;
+    return atom_sym_n (I, sym_tok->ptr, sym_tok->length);
+}
+
+static char *str_escape_n (const char *str, size_t n)
+{
+    char *result = malloc (n + 1); // +1 for null terminator
+    if (!result) return NULL;
+
+    char *r = result;
+    const char *s = str;
+
+    for (size_t i = 0; i < n; ++i, ++s, ++r) // Increment i
+    {
+        if (*s == '\\' && i + 1 < n)
+        {
+            switch (*(s+1))
+            {
+                case 'r': *r = '\r'; break;
+                case 'n': *r = '\n'; break;
+                case 't': *r = '\t'; break;
+                case '0': *r = '\0'; break;
+                case 'b': *r = '\b'; break;
+                case '\\': *r = '\\'; break;
+                case '\'': *r = '\''; break;
+                case '\"': *r = '\"'; break;
+                default: free (result); return NULL;
+            }
+            s += 1;
+            i += 1;
+        }
+        else
+        {
+            *r = *s;
+        }
+    }
+    *r = '\0'; // Null-terminate for strdup
+    return result;
+}
+
+static AtomRef
+        parse_string (Interpreter *I, struct token **head, ParseError *out_err)
+{
+    struct token *str_tok = expect (head, TOKEN_STRING, out_err);
+    char *str;
+    AtomRef result;
+    
+    str = str_escape_n (str_tok->ptr+1, str_tok->length - 2);
+    if (!str)
+    {
+        if (out_err)
+        {
+            out_err->code = PARSE_ERR_INVALID_ESCAPE_CODE;
+            out_err->offset = str_tok->offset;
+        }
+        return NULL;
+    }
+    
+    result = atom_str (I, str);
+    free (str);
+    return result;
+}
+
+static AtomRef
+        parse_atom_tokens (Interpreter *I, struct token **head, ParseError *out_err)
+{
+    struct token *next_tok = peek (head, out_err);
+    if (!next_tok) return NULL;
+    
+    switch (next_tok->kind)
+    {
+        case TOKEN_STRING: return parse_string (I, head, out_err);
+        case TOKEN_NUMBER: return parse_number (I, head, out_err);
+        case TOKEN_SYMBOL: return parse_symbol (I, head, out_err);
+        case TOKEN_LPAREN: return parse_list (I, head, out_err);
+        case TOKEN_EOF:
+            if (out_err)
+            {
+                out_err->code = PARSE_ERR_UNEXPECTED_EOF;
+                out_err->offset = next_tok->offset;
+            }
+            return NULL;
+        case TOKEN_RPAREN:
+            if (out_err)
+            {
+                out_err->code = PARSE_ERR_UNBALANCED_PAREN;
+                out_err->offset = next_tok->offset;
+            }
+            return NULL;
+            default: assert (false);
+    }
+}
+
+AtomRef parse_atom (Interpreter *I, const char *s, ParseError *out_err)
+{
+    struct token *tokens = lex (s, strlen (s), out_err);
+    struct token *cursor = tokens;
+    struct token **head = &cursor;
+    AtomRef root;
+    
+    if (!tokens) return NULL;
+    
+    root = parse_atom_tokens (I, head, out_err);
+    
+    token_free (tokens);
+    
+    return root;
 }
