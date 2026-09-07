@@ -1,0 +1,9 @@
+(do
+    (define A 0)
+    (define B 1)
+    (println B)
+    (while (lt B 1000)
+        (define t B)
+        (set B (+ A B))
+        (set A t)
+        (println B)))
