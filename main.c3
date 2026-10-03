@@ -67,6 +67,7 @@ fn void AtomData.free (&self)
     
     mem::free(self);
 }
+
 const AtomData NIL = { .tag = Tag.NIL };
 Atom nil = &NIL;
 
@@ -107,6 +108,7 @@ fn void? Env.set (Env* env, Atom sym, Atom val)
 	return @errf(UNBOUND_SYMBOL, "symbol `%s` is undefined", sym.as.symbol);
 }
 
+<* @require sym.tag == Tag.SYM *>
 fn void? Env.define (Env* env, Atom sym, Atom val)
 {
 	foreach (b : env.bindings)
@@ -125,8 +127,107 @@ struct State
 {
 	OrderedMap{String, Atom} intern_table; // makes sure, that only one identical symbol exists at once
 	List{Atom} roots; // FIXME: replace with something, that doesn't allocate all the fucking time
-	List{Atom} allocated; // for gc
-	Env *env; // current env frame: for gc
+	GarbageCollector gc;
+}
+
+fn void State.init (&self, Env *env)
+{
+	self.roots.init (mem);
+	self.gc.init (env);
+}
+
+struct GarbageCollector
+{
+	List{Atom} allocated;
+	HashSet{uptr} marked;
+	Env *env;
+}
+
+fn void GarbageCollector.init (&self, Env *env)
+{
+	self.marked.init (mem);
+	self.allocated.init (mem);
+	self.env = env;
+}
+
+fn void GarbageCollector.free (&self)
+{
+	self.allocated.free ();
+	self.marked.free ();
+}
+
+fn void GarbageCollector.clear (&self)
+{
+	self.marked.clear();
+}
+
+fn void GarbageCollector.mark (&self, Atom atom)
+{
+    Atom cur = atom;
+    while (cur != nil && !self.marked.contains ((uptr) cur))
+    {
+        self.marked.add ((uptr) cur);
+
+        if (cur.tag == Tag.PAIR)
+        {
+            self.mark (cur.car());
+            cur = cur.cdr ();
+        }
+        else
+        {
+            break;
+        }
+    }
+}
+
+fn void GarbageCollector.sweep (&self)
+{
+    sz write_index = 0;
+    sz count = self.allocated.len();
+
+    for (sz i = 0; i < count; i++)
+    {
+        Atom atom = self.allocated.get(i);
+
+        if (self.marked.contains ((uptr) atom))
+        {
+			self.allocated.set_at (write_index, atom);
+            write_index++;
+        }
+        else
+        {
+            atom.free();
+        }
+    }
+
+    self.allocated.size = write_index;
+	self.clear ();
+}
+
+fn void State.garbage_collect (&self)
+{
+	Env *e = self.gc.env;
+	while (e)
+	{
+		foreach (binding : e.bindings)
+		{
+			self.gc.mark (binding.symbol);
+			self.gc.mark (binding.value);
+		}
+		e = e.parent;
+	}
+
+	foreach (atom : self.roots)
+	{
+		self.gc.mark (atom);
+	}
+
+	self.intern_table.@each(; key, value)
+    {
+        self.gc.mark (value);
+    };
+
+	self.gc.sweep ();
 }
 
 fn void State.destroy (&self)
@@ -134,27 +235,27 @@ fn void State.destroy (&self)
     self.roots.clear ();
     self.intern_table.clear ();
 
-    GarbageCollector gc;
-    gc.init (&self.allocated);
-    gc.sweep ();
+	self.gc.clear ();
+	self.gc.sweep ();
+	self.gc.free ();
 
     self.roots.free ();
-    self.allocated.free ();
     self.intern_table.free ();
 }
 
 faultdef UNBOUND_SYMBOL;
 faultdef REDEFINED_SYMBOL;
 faultdef TYPE_FUCKUP; // idk..
+faultdef NOT_APPLICABLE;
 
 fn Atom State.atom (&self, Tag tag)
 {
-	if (self.allocated.size > GC_SWEEP_FLOOR) self.garbage_collect ();
+	if (self.gc.allocated.size > GC_SWEEP_FLOOR) self.garbage_collect ();
 
 	Atom new = mem::alloc (AtomData); // FIXME: dedicated atom area
 	new.tag = tag;
 
-	self.allocated.push_front (new);
+	self.gc.allocated.push_front (new);
 
 	return new;
 }
@@ -207,90 +308,6 @@ fn Atom? State.rpop (&self)
 	return self.roots.pop_first ();
 }
 
-struct GarbageCollector
-{
-	List{Atom} *allocated;
-	HashSet{uptr} marked;
-}
-
-fn void GarbageCollector.init (&self, List{Atom} *allocated)
-{
-	self.allocated = allocated;
-	self.marked.init (mem);
-}
-
-fn void GarbageCollector.mark (&self, Atom atom)
-{
-    Atom cur = atom;
-    while (cur != nil && !self.marked.contains((uptr) cur))
-    {
-        self.marked.add ((uptr) cur);
-
-        if (cur.tag == Tag.PAIR)
-        {
-            self.mark (cur.car());
-            cur = cur.cdr();
-        }
-        else
-        {
-            break;
-        }
-    }
-}
-
-fn void GarbageCollector.sweep (&self)
-{
-    sz write_index = 0;
-    sz count = self.allocated.len();
-
-    for (sz i = 0; i < count; i++)
-    {
-        Atom atom = self.allocated.get(i);
-
-        if (self.marked.contains((uptr) atom))
-        {
-			self.allocated.set_at(write_index, atom);
-            write_index++;
-        }
-        else
-        {
-            atom.free();
-        }
-    }
-
-    self.allocated.size = write_index;
-	self.marked.free ();
-}
-
-fn void State.garbage_collect (&self)
-{
-	GarbageCollector gc;
-	gc.init (&self.allocated);
-
-	Env *e = self.env;
-	while (e)
-	{
-		foreach (binding : e.bindings)
-		{
-			gc.mark (binding.symbol);
-			gc.mark (binding.value);
-		}
-		e = e.parent;
-	}
-
-	foreach (atom : self.roots)
-	{
-		gc.mark (atom);
-	}
-
-	self.intern_table.@each(; key, value)
-    {
-        gc.mark (value);
-    };
-
-	gc.sweep ();
-}
-
 fn void? State.define_symbol (&self, String sym, Atom value, Env *env)
 {
 	Atom symbol_atom = self.symbol (sym);
@@ -312,6 +329,9 @@ fn void? State.define_primitive (&self, String sym, PrimitiveCallback prim, Env 
 	return result~;
 }
 
+<* @require args.tag == Tag.PAIR
+   @require args.cdr().tag == Tag.PAIR
+   @require args.cdr().cdr().tag == Tag.PAIR *>
 fn Atom? State.evaluate_if (&self, Atom args, Env *env)
 {
 	self.rpush (args);
@@ -345,15 +365,23 @@ fn Atom? State.evaluate_do (&self, Atom args, Env *env)
 
 fn Atom? State.evaluate_define (&self, Atom args, Env *env)
 {
-	Atom symbol = args.car ();
-	Atom value_expr = args.cdr().car();
+	self.rpush (args);
+	defer self.rpop()!!;
 
-	Atom value = self.evaluate (value_expr, env)!;
-	self.rpush (value);
-	defer self.rpop ()!!;
-	
-	env.define (symbol, value)!;
-	
+	Atom head = args;
+	while (head != nil)
+	{
+		Atom symbol = head.car ();
+		Atom value_expr = head.cdr().car();
+		head = head.cdr().cdr();
+
+		Atom value = self.evaluate (value_expr, env)!;
+		self.rpush (value);
+		defer self.rpop ()!!;
+		
+		env.define (symbol, value)!;
+	}
+
 	return nil;
 }
 
@@ -384,15 +412,15 @@ fn Atom? State.apply (&self, Atom function, Atom args, Env *parent)
 	{
 	case PRIM: return function.as.primitive (self, parent, args);
 	default:
-		unreachable("fuck you");
+		return @errf (NOT_APPLICABLE, "Atom with tag `%d` can't be applied", function.tag);
 	}
 }
 
 fn Atom? State.evaluate (&self, Atom expr, Env *env)
 {
-	Env *prev_env = self.env;
-	self.env = env;
-	defer self.env = prev_env;
+	Env *prev_env = self.gc.env;
+	self.gc.env = env;
+	defer self.gc.env = prev_env;
 
 	switch (expr.tag)
 	{
@@ -498,7 +526,10 @@ fn void main ()
 	*/
 	/* this is about to be VERY ugly */
 
+	Env e;
 	State s;
+	
+	s.init (&e);
 	defer s.destroy ();
 
 	Atom msg2 = s.string ("lenin grzyb");
@@ -559,9 +590,6 @@ fn void main ()
 	s.rpush (if_expr);
 
 	// lmao
-
-	Env e;
-	s.env = &e;
 
 	s.define_symbol("nil", nil, &e)!!;
 	s.define_primitive("lt", &prim_lt, &e)!!;
