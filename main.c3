@@ -23,7 +23,7 @@ enum Tag
 }
 
 alias Atom = AtomData*;
-alias PrimitiveCallback = fn Atom? (State*, Env*, Atom args);
+alias PrimitiveCallback = fn Atom? (State*, Env, Atom args);
 
 struct AtomData
 {
@@ -71,54 +71,61 @@ fn void AtomData.free (&self)
 const AtomData NIL = { .tag = Tag.NIL };
 Atom nil = &NIL;
 
-struct Binding { Atom symbol; Atom value; }
-struct Env
-{
-	Env *parent;
-	List{Binding} bindings;
-}
+alias Env = Atom; // (parent ((symbol value) ((symbol value) (... nil))))
 
 <* @require sym.tag == Tag.SYM *>
-fn Atom? Env.get (Env* env, Atom sym)
+fn Atom? env_get (Env env, Atom sym)
 {
-	for (Env *e = env; e != null; e = e.parent)
+	for (Env e = env; e != nil; e = e.car())
 	{
-		foreach (b : e.bindings)
+		Atom list = e.cdr();
+
+		while (list != nil)
 		{
-			if (b.symbol == sym) return b.value; // pointer comparison
+			Atom head = list.car();
+			Atom rest = list.cdr();
+
+			if (head.car() == sym) return head.cdr();
+
+			list = rest;
 		}
 	}
+
 	return @errf(UNBOUND_SYMBOL, "symbol `%s` is unbound", sym.as.symbol);
 }
 
 <* @require sym.tag == Tag.SYM *>
-fn void? Env.set (Env* env, Atom sym, Atom val)
+fn void? env_set (Env env, Atom sym, Atom val)
 {
-	for (Env *e = env; e != null; e = e.parent)
+	for (Env e = env; e != nil; e = e.car())
 	{
-		foreach (b : e.bindings)
+		Atom list = e.cdr();
+
+		while (list != nil)
 		{
-			if (b.symbol == sym)
+			Atom head = list.car();
+			Atom rest = list.cdr();
+
+			if (head.car() == sym)
 			{
-				b.value = val;
+				head.as.pair.tail = val;
 				return;
 			}
+
+			list = rest;
 		}
 	}
+
 	return @errf(UNBOUND_SYMBOL, "symbol `%s` is undefined", sym.as.symbol);
 }
 
 <* @require sym.tag == Tag.SYM *>
-fn void? Env.define (Env* env, Atom sym, Atom val)
+fn void? env_define (Env env, State *s, Atom sym, Atom val)
 {
-	foreach (b : env.bindings)
-	{
-		if (b.symbol == sym)
-		{
-			return @errf(REDEFINED_SYMBOL, "tried to redefine symbol `%s`", sym.as.symbol);
-		}
-	}
-	env.bindings.push_front((Binding){ sym, val });
+	Atom binding = s.pair (sym, val);
+	s.rpush (binding);
+	env.as.pair.tail = s.pair(binding, env.cdr());
+	s.rpop ()!;
 }
 
 const sz GC_SWEEP_FLOOR = 2;
@@ -128,26 +135,31 @@ struct State
 	OrderedMap{String, Atom} intern_table; // makes sure, that only one identical symbol exists at once
 	List{Atom} roots; // FIXME: replace with something, that doesn't allocate all the fucking time
 	GarbageCollector gc;
+	Env global;
 }
 
-fn void State.init (&self, Env *env)
+fn void State.init (&self)
 {
 	self.roots.init (mem);
-	self.gc.init (env);
+	self.intern_table.init (mem);
+	self.gc.init ();
+
+	self.global = self.pair (nil, nil);
+	self.gc.env = self.global;
 }
 
 struct GarbageCollector
 {
 	List{Atom} allocated;
 	HashSet{uptr} marked;
-	Env *env;
+	Env env;
 }
 
-fn void GarbageCollector.init (&self, Env *env)
+fn void GarbageCollector.init (&self)
 {
 	self.marked.init (mem);
 	self.allocated.init (mem);
-	self.env = env;
+	self.env = nil;
 }
 
 fn void GarbageCollector.free (&self)
@@ -206,16 +218,7 @@ fn void GarbageCollector.sweep (&self)
 
 fn void State.garbage_collect (&self)
 {
-	Env *e = self.gc.env;
-	while (e)
-	{
-		foreach (binding : e.bindings)
-		{
-			self.gc.mark (binding.symbol);
-			self.gc.mark (binding.value);
-		}
-		e = e.parent;
-	}
+	self.gc.mark (self.global);
 
 	foreach (atom : self.roots)
 	{
@@ -279,7 +282,7 @@ fn Atom State.symbol (&self, String sym)
 	if (try Atom *existing = self.intern_table.get_ref (sym)) return *existing;
 	Atom new = self.atom (Tag.SYM);
 	new.as.symbol = sym.copy (mem);
-	self.intern_table.set (sym, new);
+	self.intern_table.set(new.as.symbol, new);
 	return new;
 }
 
@@ -308,22 +311,22 @@ fn Atom? State.rpop (&self)
 	return self.roots.pop_first ();
 }
 
-fn void? State.define_symbol (&self, String sym, Atom value, Env *env)
+fn void? State.define_symbol (&self, String sym, Atom value, Env env)
 {
 	Atom symbol_atom = self.symbol (sym);
 	self.rpush (symbol_atom);
-	fault result = @catch(env.define(symbol_atom, value));
+	fault result = @catch(env_define(env, self, symbol_atom, value));
 	self.rpop ()!;
 	return result~;
 }
 
-fn void? State.define_primitive (&self, String sym, PrimitiveCallback prim, Env *env)
+fn void? State.define_primitive (&self, String sym, PrimitiveCallback prim, Env env)
 {
 	Atom symbol_atom = self.symbol (sym);
 	self.rpush (symbol_atom);
 	Atom prim_atom = self.primitive (prim);
 	self.rpush (prim_atom);
-	fault result = @catch (env.define (symbol_atom, prim_atom));
+	fault result = @catch (env_define (env, self, symbol_atom, prim_atom));
 	self.rpop()!;
 	self.rpop()!;
 	return result~;
@@ -332,7 +335,7 @@ fn void? State.define_primitive (&self, String sym, PrimitiveCallback prim, Env 
 <* @require args.tag == Tag.PAIR
    @require args.cdr().tag == Tag.PAIR
    @require args.cdr().cdr().tag == Tag.PAIR *>
-fn Atom? State.evaluate_if (&self, Atom args, Env *env)
+fn Atom? State.evaluate_if (&self, Atom args, Env env)
 {
 	self.rpush (args);
 	defer self.rpop()!!;
@@ -352,7 +355,7 @@ fn Atom? State.evaluate_if (&self, Atom args, Env *env)
 	}
 }
 
-fn Atom? State.evaluate_do (&self, Atom args, Env *env)
+fn Atom? State.evaluate_do (&self, Atom args, Env env)
 {
 	Atom result = nil;
 	while (args.tag == Tag.PAIR)
@@ -363,7 +366,7 @@ fn Atom? State.evaluate_do (&self, Atom args, Env *env)
 	return result;
 }
 
-fn Atom? State.evaluate_define (&self, Atom args, Env *env)
+fn Atom? State.evaluate_define (&self, Atom args, Env env)
 {
 	self.rpush (args);
 	defer self.rpop()!!;
@@ -379,13 +382,13 @@ fn Atom? State.evaluate_define (&self, Atom args, Env *env)
 		self.rpush (value);
 		defer self.rpop ()!!;
 		
-		env.define (symbol, value)!;
+		env_define (env, self, symbol, value)!;
 	}
 
 	return nil;
 }
 
-fn Atom? State.evaluate_list (&self, Atom args, Env *env)
+fn Atom? State.evaluate_list (&self, Atom args, Env env)
 {
 	if (args == nil) return nil;
 
@@ -406,7 +409,7 @@ fn Atom? State.evaluate_list (&self, Atom args, Env *env)
 	return result;
 }
 
-fn Atom? State.apply (&self, Atom function, Atom args, Env *parent)
+fn Atom? State.apply (&self, Atom function, Atom args, Env parent)
 {
 	switch (function.tag)
 	{
@@ -416,9 +419,10 @@ fn Atom? State.apply (&self, Atom function, Atom args, Env *parent)
 	}
 }
 
-fn Atom? State.evaluate (&self, Atom expr, Env *env)
+fn Atom? State.evaluate (&self, Atom expr, Env env)
 {
-	Env *prev_env = self.gc.env;
+	// Env *prev_env = self.gc.env;
+	Env prev_env = self.gc.env;
 	self.gc.env = env;
 	defer self.gc.env = prev_env;
 
@@ -430,7 +434,7 @@ fn Atom? State.evaluate (&self, Atom expr, Env *env)
 	case PRIM:
 		return expr;
 	case SYM:
-		return env.get(expr)!;
+		return env_get(env, expr)!;
 	case PAIR:
 		Atom head = expr.car();
 		Atom tail = expr.cdr();
@@ -453,7 +457,7 @@ fn Atom? State.evaluate (&self, Atom expr, Env *env)
 	}
 }
 
-fn Atom? prim_lt (State *self, Env *env, Atom args)
+fn Atom? prim_lt (State *self, Env env, Atom args)
 {
 	// already evaluated by `evaluate_list` called in `evaluate`
 	Atom lhs = args.car();
@@ -474,7 +478,7 @@ fn Atom? prim_lt (State *self, Env *env, Atom args)
 	}
 }
 
-fn Atom? prim_print (State *self, Env *env, Atom value)
+fn Atom? prim_print (State *self, Env env, Atom value)
 {
 	// FIXME: replace with full serialization code
 	switch (value.tag)
@@ -920,24 +924,27 @@ fn void main ()
 		(print "uoooogghh~~!!")
 		(print "lenin grzyb"))`;
 
-	Env e;
 	State s;
 	
-	s.init (&e);
+	s.init ();
 	defer s.destroy ();
 
-	s.define_symbol("nil", nil, &e)!!;
-	s.define_primitive("lt", &prim_lt, &e)!!;
-	s.define_primitive("print", &prim_print, &e)!!;
+	Env e = s.global;
+
+	s.define_symbol("nil", nil, e)!!;
+	s.define_primitive("lt", &prim_lt, e)!!;
+	s.define_primitive("print", &prim_print, e)!!;
 
 	Atom fnnuy = s.number (2137);
 	s.rpush (fnnuy);
-	s.define_symbol("x", fnnuy, &e)!!;
+	s.define_symbol("x", fnnuy, e)!!;
 	s.rpop ()!!;
 
 	Atom if_expr = s.parse_string (sexpr)!!;
 	s.rpush (if_expr);
 
-	Atom result = s.evaluate (if_expr, &e)!!;
+	Atom result = s.evaluate (if_expr, e)!!;
 	s.rpop ()!!;
 }
+
+// TODO: closures
