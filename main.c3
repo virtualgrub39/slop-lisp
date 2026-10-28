@@ -20,10 +20,16 @@ enum Tag
 	SYM,
 	PAIR,
 	PRIM,
+	CLOS,
 }
 
 alias Atom = AtomData*;
 alias PrimitiveCallback = fn Atom? (State*, Env, Atom args);
+
+const AtomData NIL = { .tag = Tag.NIL };
+Atom nil = &NIL;
+
+alias Env = Atom; // (parent ((symbol value) ((symbol value) (... nil))))
 
 struct AtomData
 {
@@ -36,6 +42,11 @@ struct AtomData
 		String symbol;
 		struct pair { Atom head; Atom tail; }
 		PrimitiveCallback primitive;
+		struct closure {
+			Env env;
+			Atom args;
+			Atom expr;
+		}
 	}
 }
 
@@ -67,11 +78,6 @@ fn void AtomData.free (&self)
     
     mem::free(self);
 }
-
-const AtomData NIL = { .tag = Tag.NIL };
-Atom nil = &NIL;
-
-alias Env = Atom; // (parent ((symbol value) ((symbol value) (... nil))))
 
 <* @require sym.tag == Tag.SYM *>
 fn Atom? env_get (Env env, Atom sym)
@@ -183,12 +189,18 @@ fn void GarbageCollector.mark (&self, Atom atom)
         if (cur.tag == Tag.PAIR)
         {
             self.mark (cur.car());
-            cur = cur.cdr ();
+            cur = cur.cdr();
+        }
+        else if (cur.tag == Tag.CLOS)
+        {
+            self.mark (cur.as.closure.env);
+            self.mark (cur.as.closure.args);
+            cur = cur.as.closure.expr;
         }
         else
-        {
-            break;
-        }
+		{
+			break;
+		}
     }
 }
 
@@ -250,6 +262,7 @@ faultdef UNBOUND_SYMBOL;
 faultdef REDEFINED_SYMBOL;
 faultdef TYPE_FUCKUP; // idk..
 faultdef NOT_APPLICABLE;
+faultdef ARITY_ERROR;
 
 fn Atom State.atom (&self, Tag tag)
 {
@@ -298,6 +311,15 @@ fn Atom State.primitive (&self, PrimitiveCallback cb)
 {
 	Atom new = self.atom (Tag.PRIM);
 	new.as.primitive = cb;
+	return new;
+}
+
+fn Atom State.closure (&self, Env e, Atom args, Atom expr)
+{
+	Atom new = self.atom (Tag.CLOS);
+	new.as.closure.env = e;
+	new.as.closure.args = args;
+	new.as.closure.expr = expr;
 	return new;
 }
 
@@ -409,11 +431,49 @@ fn Atom? State.evaluate_list (&self, Atom args, Env env)
 	return result;
 }
 
+fn Atom? State.evaluate_closure (&self, Atom args, Env env)
+{
+	self.rpush (args);
+
+	Atom clos_args = args.car();
+	Atom expr = args.cdr().car();
+
+	Atom result = self.closure (env, clos_args, expr);
+
+	self.rpop ()!;
+
+	return result;
+}
+
+fn void? State.bind_args (&self, Atom closure, Atom args_val, Env env)
+{
+	Atom args = closure.as.closure.args;
+
+	while (args != nil && args_val != nil)
+	{
+		env_define (env, self, args.car(), args_val.car())!;
+		args = args.cdr();
+		args_val = args_val.cdr();
+	}
+
+	if (args != nil || args_val != nil)
+	{
+		return ARITY_ERROR~;
+	}
+}
+
 fn Atom? State.apply (&self, Atom function, Atom args, Env parent)
 {
 	switch (function.tag)
 	{
 	case PRIM: return function.as.primitive (self, parent, args);
+	case CLOS:
+		Env new = self.pair (function.as.closure.env, nil);
+		self.rpush (new);
+		defer self.rpop()!!;
+
+		self.bind_args (function, args, new)!;
+		return self.evaluate (function.as.closure.expr, new);
 	default:
 		return @errf (NOT_APPLICABLE, "Atom with tag `%d` can't be applied", function.tag);
 	}
@@ -421,7 +481,7 @@ fn Atom? State.apply (&self, Atom function, Atom args, Env parent)
 
 fn Atom? State.evaluate (&self, Atom expr, Env env)
 {
-	// Env *prev_env = self.gc.env;
+	// Is ts even needed?
 	Env prev_env = self.gc.env;
 	self.gc.env = env;
 	defer self.gc.env = prev_env;
@@ -432,6 +492,7 @@ fn Atom? State.evaluate (&self, Atom expr, Env env)
 	case NUM:
 	case STR:
 	case PRIM:
+	case CLOS:
 		return expr;
 	case SYM:
 		return env_get(env, expr)!;
@@ -444,6 +505,7 @@ fn Atom? State.evaluate (&self, Atom expr, Env env)
 			if (head == self.symbol ("if")) return self.evaluate_if (tail, env);
 			if (head == self.symbol ("do")) return self.evaluate_do (tail, env);
 			if (head == self.symbol ("define")) return self.evaluate_define (tail, env);
+			if (head == self.symbol ("closure")) return self.evaluate_closure (tail, env);
 		}
 
 		Atom function = self.evaluate (head, env)!;
@@ -455,69 +517,6 @@ fn Atom? State.evaluate (&self, Atom expr, Env env)
 		Atom result = self.apply (function, args, env)!;
 		return result;
 	}
-}
-
-fn Atom? prim_lt (State *self, Env env, Atom args)
-{
-	// already evaluated by `evaluate_list` called in `evaluate`
-	Atom lhs = args.car();
-	Atom rhs = args.cdr().car();
-
-	if (lhs.tag != NUM || rhs.tag != NUM)
-	{
-		return @errf (TYPE_FUCKUP, "`lt` expected two `NUM` arguments, but it got something different ig");
-	}
-
-	if (lhs.as.number < rhs.as.number)
-	{
-		return self.number (420); // FIXME: maybe a `t` symbol?
-	}
-	else
-	{
-		return nil;
-	}
-}
-
-fn Atom? prim_print (State *self, Env env, Atom value)
-{
-	// FIXME: replace with full serialization code
-	switch (value.tag)
-	{
-	case STR: io::printf("%s", value.as.string);
-	case SYM: io::printf("%s", value.as.symbol);
-	case NUM: io::printf("%g", value.as.number);
-	case NIL: io::print ("nil");
-	case PRIM: io::printf ("prim<%p>", value.as.primitive);
-	case PAIR:
-		Atom cur = value;
-
-		io::print ("(");
-		while (cur != nil && cur.tag == PAIR)
-		{
-			Atom next = cur.cdr();
-			
-			prim_print (self, env, cur.car())!;
-
-			if (!next || next == nil)
-			{
-				break;
-			}
-			else if (next.tag == PAIR)
-			{
-				io::print (" ");
-				cur = next;
-			}
-			else
-			{
-				io::print (" . ");
-				prim_print (self, env, next)!;
-				break;
-			}
-		}
-		io::print (")");
-		break;
-	}
-	return nil;
 }
 
 faultdef TODO;
@@ -917,13 +916,109 @@ fn Atom? State.parse_string (&self, String sexpr, ParsingError *out_err = null)
 	return expr;
 }
 
+fn Atom? prim_lt (State *self, Env env, Atom args)
+{
+	// already evaluated by `evaluate_list` called in `evaluate`
+	Atom lhs = args.car();
+	Atom rhs = args.cdr().car();
+
+	if (lhs.tag != NUM || rhs.tag != NUM)
+	{
+		return @errf (TYPE_FUCKUP, "`lt` expected two `NUM` arguments, but it got something different ig");
+	}
+
+	if (lhs.as.number < rhs.as.number)
+	{
+		return self.number (420); // FIXME: maybe a `t` symbol?
+	}
+	else
+	{
+		return nil;
+	}
+}
+
+fn Atom? prim_print (State *self, Env env, Atom value)
+{
+	// FIXME: replace with full serialization code
+	switch (value.tag)
+	{
+	case STR: io::printf("%s", value.as.string);
+	case SYM: io::printf("%s", value.as.symbol);
+	case NUM: io::printf("%g", value.as.number);
+	case NIL: io::print ("nil");
+	case PRIM: io::printf ("prim<%p>", value.as.primitive);
+	case CLOS: io::printf ("closure :3");
+	case PAIR:
+		Atom cur = value;
+
+		io::print ("(");
+		while (cur != nil && cur.tag == PAIR)
+		{
+			Atom next = cur.cdr();
+			
+			prim_print (self, env, cur.car())!;
+
+			if (!next || next == nil)
+			{
+				break;
+			}
+			else if (next.tag == PAIR)
+			{
+				io::print (" ");
+				cur = next;
+			}
+			else
+			{
+				io::print (" . ");
+				prim_print (self, env, next)!;
+				break;
+			}
+		}
+		io::print (")");
+		break;
+	}
+	return nil;
+}
+
+fn Atom? prim_eq (State *self, Env env, Atom args)
+{
+	Atom lhs = args.car();
+	Atom rhs = args.cdr().car();
+
+	if (lhs.tag != rhs.tag) return nil;
+
+	bool eq = false;
+
+	switch (lhs.tag)
+	{
+	case STR: eq = lhs.as.string == rhs.as.string;
+	case SYM: eq = lhs.as.symbol == rhs.as.symbol;
+	case NUM: eq = lhs.as.number == rhs.as.number;
+	case NIL: eq = lhs == nil && rhs == nil;
+	case PRIM: eq = lhs.as.primitive == rhs.as.primitive;
+	case CLOS: eq = false;
+	case PAIR: eq = false; 
+	}
+
+	if (eq) return self.number(1);
+	return nil;
+}
+
+fn Atom? prim_add (State *self, Env env, Atom args)
+{
+	Atom lhs = args.car();
+	Atom rhs = args.cdr().car();
+
+	if (lhs.tag != NUM || rhs.tag != NUM)
+	{
+		return @errf (TYPE_FUCKUP, "`+` expected two `NUM` arguments, but it got something different ig");
+	}
+
+	return self.number (lhs.as.number + rhs.as.number);
+}
+
 fn void main ()
 {
-	/* Test expression */
-	String sexpr = `(if (lt x 420)
-		(print "uoooogghh~~!!")
-		(print "lenin grzyb"))`;
-
 	State s;
 	
 	s.init ();
@@ -933,18 +1028,27 @@ fn void main ()
 
 	s.define_symbol("nil", nil, e)!!;
 	s.define_primitive("lt", &prim_lt, e)!!;
+	s.define_primitive("=", &prim_eq, e)!!;
+	s.define_primitive("+", &prim_add, e)!!;
 	s.define_primitive("print", &prim_print, e)!!;
 
-	Atom fnnuy = s.number (2137);
+	Atom fnnuy = s.number (22);
 	s.rpush (fnnuy);
 	s.define_symbol("x", fnnuy, e)!!;
 	s.rpop ()!!;
 
-	Atom if_expr = s.parse_string (sexpr)!!;
-	s.rpush (if_expr);
+	String function = "(define fnuuy (closure (a) (+ a 2)))";
+	Atom function_expr = s.parse_string (function)!!;
+	s.rpush (function_expr);
+	defer s.rpop()!!;
 
-	Atom result = s.evaluate (if_expr, e)!!;
-	s.rpop ()!!;
+	String main = `(if (= (fnuuy x) 69) (print "very fnuuy") (print "not fnuuy"))`;
+	Atom main_expr = s.parse_string (main)!!;
+	s.rpush (main_expr);
+	defer s.rpop()!!;
+
+	s.evaluate (function_expr, e)!!;
+	s.evaluate (main_expr, e)!!;
 }
 
-// TODO: closures
+// TODO: serialization of Atom
